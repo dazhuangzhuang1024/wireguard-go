@@ -93,32 +93,39 @@ func (peer *Peer) SendKeepalive() {
 }
 
 func (peer *Peer) SendHandshakeInitiation(isRetry bool) error {
-	if !isRetry {
-		peer.timers.handshakeAttempts.Store(0)
-	}
+	return peer.sendHandshakeInitiation(isRetry, false)
+}
 
+func (peer *Peer) rescheduleHandshakeRetry(isRetry bool, retryAfter time.Duration) {
+	if !isRetry || retryAfter <= 0 || peer.timers.retransmitHandshake == nil || !peer.timersActive() {
+		return
+	}
+	peer.timers.retransmitHandshake.Mod(retryAfter)
+}
+
+func (peer *Peer) sendHandshakeInitiation(isRetry bool, resetEndpoint bool) error {
 	peer.handshake.mutex.RLock()
-	if time.Since(peer.handshake.lastSentHandshake) < RekeyTimeout {
-		peer.handshake.mutex.RUnlock()
-		return nil
-	}
+	ready, retryAfter := peer.handshakeInitiationReady(isRetry, time.Now())
 	peer.handshake.mutex.RUnlock()
-
-	peer.handshake.mutex.Lock()
-	if time.Since(peer.handshake.lastSentHandshake) < RekeyTimeout {
-		peer.handshake.mutex.Unlock()
+	if !ready {
+		peer.rescheduleHandshakeRetry(isRetry, retryAfter)
 		return nil
 	}
-	peer.handshake.lastSentHandshake = time.Now()
-	peer.handshake.mutex.Unlock()
 
-	peer.device.log.Verbosef("%v - Sending handshake initiation", peer)
-
-	msg, err := peer.device.CreateMessageInitiation(peer)
+	msg, ready, retryAfter, err := peer.prepareHandshakeInitiation(isRetry, resetEndpoint)
+	if !ready {
+		peer.rescheduleHandshakeRetry(isRetry, retryAfter)
+		return nil
+	}
 	if err != nil {
 		peer.device.log.Errorf("%v - Failed to create initiation message: %v", peer, err)
 		return err
 	}
+	if !isRetry {
+		peer.timers.handshakeAttempts.Store(0)
+	}
+
+	peer.device.log.Verbosef("%v - Sending handshake initiation", peer)
 
 	var buf [MessageInitiationSize]byte
 	writer := bytes.NewBuffer(buf[:0])

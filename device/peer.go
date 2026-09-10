@@ -38,6 +38,10 @@ type Peer struct {
 		handshakeAttempts       atomic.Uint32
 		needAnotherKeepalive    atomic.Bool
 		sentLastMinuteHandshake atomic.Bool
+		endpointReset           struct {
+			sync.Mutex
+			last time.Time
+		}
 	}
 
 	state struct {
@@ -132,6 +136,74 @@ func (peer *Peer) SendBuffers(buffers [][]byte) error {
 		peer.txBytes.Add(totalLen)
 	}
 	return err
+}
+
+// hasConfirmedKeypairSinceLastHandshake requires the caller to hold the
+// handshake mutex. A zeroed handshake state alone is not enough: responders
+// keep an unconfirmed key in keypairs.next until authenticated data arrives.
+func (peer *Peer) hasConfirmedKeypairSinceLastHandshake() bool {
+	keypair := peer.keypairs.Current()
+	return keypair != nil && !keypair.created.Before(peer.handshake.lastSentHandshake)
+}
+
+// handshakeInitiationReady requires the caller to hold the handshake mutex.
+// retryAfter is nonzero only when a retry is still needed but rate-limited.
+func (peer *Peer) handshakeInitiationReady(isRetry bool, now time.Time) (ready bool, retryAfter time.Duration) {
+	if isRetry && peer.hasConfirmedKeypairSinceLastHandshake() {
+		return false, 0
+	}
+	elapsed := now.Sub(peer.handshake.lastSentHandshake)
+	if elapsed < RekeyTimeout {
+		return false, RekeyTimeout - elapsed
+	}
+	return true, 0
+}
+
+func (peer *Peer) prepareHandshakeInitiation(isRetry bool, resetEndpoint bool) (*MessageInitiation, bool, time.Duration, error) {
+	var resetter conn.EndpointResetter
+	var endpoint conn.Endpoint
+	if resetEndpoint {
+		peer.device.net.RLock()
+		defer peer.device.net.RUnlock()
+	}
+
+	peer.device.staticIdentity.RLock()
+	defer peer.device.staticIdentity.RUnlock()
+
+	if resetEndpoint {
+		peer.RLock()
+		defer peer.RUnlock()
+		resetter, _ = peer.device.net.bind.(conn.EndpointResetter)
+		endpoint = peer.endpoint
+	}
+
+	peer.handshake.mutex.Lock()
+	defer peer.handshake.mutex.Unlock()
+	ready, retryAfter := peer.handshakeInitiationReady(isRetry, time.Now())
+	if !ready {
+		return nil, false, retryAfter, nil
+	}
+	if isRetry {
+		attempt := peer.timers.handshakeAttempts.Add(1)
+		peer.device.log.Verbosef("%s - Handshake did not complete after %d seconds, retrying (try %d)", peer, int(RekeyTimeout.Seconds()), attempt+1)
+	}
+	if resetEndpoint {
+		resetEndpoint = peer.shouldResetEndpointOnHandshakeRetry(time.Now())
+	}
+
+	if resetEndpoint && resetter != nil && endpoint != nil {
+		reset, err := resetter.ResetEndpoint(endpoint)
+		if err != nil {
+			peer.device.log.Verbosef("%v - Failed to reset endpoint connection: %v", peer, err)
+		} else if reset {
+			peer.device.log.Verbosef("%v - Reset endpoint connection before handshake retry", peer)
+		} else {
+			peer.device.log.Verbosef("%v - No cached endpoint connection to reset before handshake retry", peer)
+		}
+	}
+	peer.handshake.lastSentHandshake = time.Now()
+	msg, err := peer.device.createMessageInitiationLocked(peer)
+	return msg, true, 0, err
 }
 
 func (peer *Peer) String() string {

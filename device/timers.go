@@ -76,6 +76,26 @@ func (peer *Peer) timersActive() bool {
 	return peer.isRunning.Load() && peer.device != nil && peer.device.isUp()
 }
 
+const endpointResetRetryInterval = 30 * time.Second
+
+func (peer *Peer) shouldResetEndpointOnHandshakeRetry(now time.Time) bool {
+	reset := &peer.timers.endpointReset
+	reset.Lock()
+	defer reset.Unlock()
+	if !reset.last.IsZero() && now.Sub(reset.last) < endpointResetRetryInterval {
+		return false
+	}
+	reset.last = now
+	return true
+}
+
+func (peer *Peer) clearEndpointResetTime() {
+	reset := &peer.timers.endpointReset
+	reset.Lock()
+	reset.last = time.Time{}
+	reset.Unlock()
+}
+
 func expiredRetransmitHandshake(peer *Peer) {
 	if peer.timers.handshakeAttempts.Load() > MaxTimerHandshakes {
 		peer.device.log.Verbosef("%s - Handshake did not complete after %d attempts, giving up", peer, MaxTimerHandshakes+2)
@@ -96,9 +116,6 @@ func expiredRetransmitHandshake(peer *Peer) {
 			peer.timers.zeroKeyMaterial.Mod(RejectAfterTime * 3)
 		}
 	} else {
-		peer.timers.handshakeAttempts.Add(1)
-		peer.device.log.Verbosef("%s - Handshake did not complete after %d seconds, retrying (try %d)", peer, int(RekeyTimeout.Seconds()), peer.timers.handshakeAttempts.Load()+1)
-
 		/* We clear the endpoint address src address, in case this is the cause of trouble. */
 		peer.Lock()
 		if peer.endpoint != nil {
@@ -106,7 +123,10 @@ func expiredRetransmitHandshake(peer *Peer) {
 		}
 		peer.Unlock()
 
-		peer.SendHandshakeInitiation(true)
+		// A connection-oriented bind can remain writable after its receive path
+		// has been silently blackholed. Reset immediately, then leave each new
+		// connection enough time to outlive the server's old-session cleanup.
+		peer.sendHandshakeInitiation(true, true)
 	}
 }
 
@@ -188,6 +208,7 @@ func (peer *Peer) timersHandshakeComplete() {
 	}
 	peer.timers.handshakeAttempts.Store(0)
 	peer.timers.sentLastMinuteHandshake.Store(false)
+	peer.clearEndpointResetTime()
 	peer.lastHandshakeNano.Store(time.Now().UnixNano())
 }
 
@@ -218,6 +239,7 @@ func (peer *Peer) timersStart() {
 	peer.timers.handshakeAttempts.Store(0)
 	peer.timers.sentLastMinuteHandshake.Store(false)
 	peer.timers.needAnotherKeepalive.Store(false)
+	peer.clearEndpointResetTime()
 }
 
 func (peer *Peer) timersStop() {
