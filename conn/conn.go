@@ -57,6 +57,13 @@ type Bind interface {
 	BatchSize() int
 }
 
+// EndpointResetter is implemented by connection-oriented binds that can
+// discard transport state for one endpoint. WireGuard uses it before a
+// handshake retransmission so a silently blackholed connection is not reused.
+type EndpointResetter interface {
+	ResetEndpoint(Endpoint) (bool, error)
+}
+
 // BindSocketToInterface is implemented by Bind objects that support being
 // tied to a single network interface. Used by wireguard-windows.
 type BindSocketToInterface interface {
