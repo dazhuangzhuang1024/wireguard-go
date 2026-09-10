@@ -182,7 +182,13 @@ func (device *Device) CreateMessageInitiation(peer *Peer) (*MessageInitiation, e
 	handshake := &peer.handshake
 	handshake.mutex.Lock()
 	defer handshake.mutex.Unlock()
+	return device.createMessageInitiationLocked(peer)
+}
 
+// createMessageInitiationLocked requires the caller to hold both the device
+// static identity read lock and the peer handshake write lock.
+func (device *Device) createMessageInitiationLocked(peer *Peer) (*MessageInitiation, error) {
+	handshake := &peer.handshake
 	// create ephemeral key
 	var err error
 	handshake.hash = InitialHash
@@ -436,7 +442,10 @@ func (device *Device) ConsumeMessageResponse(msg *MessageResponse) *Peer {
 	)
 
 	ok := func() bool {
-		// lock handshake state
+		// Keep the global lock order consistent with initiation creation and
+		// private-key updates: static identity before peer handshake state.
+		device.staticIdentity.RLock()
+		defer device.staticIdentity.RUnlock()
 
 		handshake.mutex.RLock()
 		defer handshake.mutex.RUnlock()
@@ -444,11 +453,6 @@ func (device *Device) ConsumeMessageResponse(msg *MessageResponse) *Peer {
 		if handshake.state != handshakeInitiationCreated {
 			return false
 		}
-
-		// lock private key for reading
-
-		device.staticIdentity.RLock()
-		defer device.staticIdentity.RUnlock()
 
 		// finish 3-way DH
 
@@ -500,6 +504,12 @@ func (device *Device) ConsumeMessageResponse(msg *MessageResponse) *Peer {
 	// update handshake state
 
 	handshake.mutex.Lock()
+	if handshake.state != handshakeInitiationCreated || handshake.localIndex != msg.Receiver {
+		handshake.mutex.Unlock()
+		setZero(hash[:])
+		setZero(chainKey[:])
+		return nil
+	}
 
 	handshake.hash = hash
 	handshake.chainKey = chainKey
