@@ -1,6 +1,8 @@
 package conn
 
 import (
+	"context"
+	"errors"
 	"fmt"
 	"io"
 	"net"
@@ -20,12 +22,20 @@ var (
 // MaxSegmentSize ref: device.MaxSegmentSize, we choose the max
 const MaxSegmentSize = 65535
 
-const (
-	// Keep failed network operations from blocking WireGuard recovery until
-	// the kernel's much longer TCP timeout expires.
-	tcpDialTimeout  = 5 * time.Second
-	tcpWriteTimeout = 5 * time.Second
-)
+// Keep failed network operations from blocking WireGuard recovery until the
+// kernel's much longer TCP timeout expires.
+const tcpDialTimeout = 5 * time.Second
+
+// A write gets tcpWriteTimeout plus the time to drain the batch at
+// tcpMinWriteRate, so a slow link that still makes progress is not mistaken
+// for a stalled one. A variable so tests can shorten it.
+var tcpWriteTimeout = 5 * time.Second
+
+const tcpMinWriteRate = 16 << 10 // bytes per second
+
+// Peers reach a client over the connections it dials, so inbound connections
+// exist only with a configured listen port, and even then are limited.
+const maxInboundTCPConns = 64
 
 func NewTCPBind() Bind {
 	return &TcpBind{
@@ -45,10 +55,15 @@ func NewTCPBind() Bind {
 type endpointMutex struct {
 	mu   sync.Mutex
 	refs int
+	// dials counts the dials made under mu, and dialErr holds the error of
+	// the last one, so callers that waited on mu can share its failure
+	dials   atomic.Uint64
+	dialErr error
 }
 
 type tcpConn struct {
 	conn      *net.TCPConn
+	inbound   bool
 	writeMu   sync.Mutex
 	closeOnce sync.Once
 	closeErr  error
@@ -66,9 +81,8 @@ func validateTCPBuffers(bufs [][]byte) error {
 
 func (c *tcpConn) Close() error {
 	c.closeOnce.Do(func() {
-		// Mark the connection before closing the socket so writers that are
-		// already blocked in WriteTo are interrupted by the close rather than
-		// delaying bind shutdown while holding writeMu.
+		// Closing the socket interrupts a writer blocked in WriteTo; the flag
+		// makes writers still queued on writeMu fail fast.
 		c.closed.Store(true)
 		c.closeErr = c.conn.Close()
 	})
@@ -80,22 +94,30 @@ func (c *tcpConn) Write(bufs [][]byte) error {
 		return err
 	}
 
+	// the whole batch in one vectored write
+	headers := make([]reqLen, len(bufs))
+	frames := make(net.Buffers, 0, 2*len(bufs))
+	size := 0
+	for i, buf := range bufs {
+		headers[i].FromLen(len(buf))
+		frames = append(frames, headers[i][:], buf)
+		size += len(headers[i]) + len(buf)
+	}
+	timeout := tcpWriteTimeout + time.Duration(size)*time.Second/tcpMinWriteRate
+
 	c.writeMu.Lock()
 	defer c.writeMu.Unlock()
 	if c.closed.Load() {
 		return net.ErrClosed
 	}
-	if err := c.conn.SetWriteDeadline(time.Now().Add(tcpWriteTimeout)); err != nil {
+	if err := c.conn.SetWriteDeadline(time.Now().Add(timeout)); err != nil {
+		_ = c.Close()
 		return err
 	}
-
-	for _, buf := range bufs {
-		var l reqLen
-		l.FromLen(len(buf))
-		frame := net.Buffers{l[:], buf}
-		if _, err := frame.WriteTo(c.conn); err != nil {
-			return err
-		}
+	if _, err := frames.WriteTo(c.conn); err != nil {
+		// a frame may have been cut short, so nothing may follow it
+		_ = c.Close()
+		return err
 	}
 	_ = c.conn.SetWriteDeadline(time.Time{})
 	return nil
@@ -108,13 +130,18 @@ type TcpBind struct {
 	endpointMu map[string]*endpointMutex
 	listener   *net.TCPListener
 	fwmark     uint32
+	inbound    atomic.Int32
 
 	dataPool  sync.Pool
 	recvChan  chan *recvData
 	closeChan chan struct{}
+
+	// dial replaces the system dialer in tests
+	dial func(ctx context.Context, network, address string) (net.Conn, error)
 }
 
-func (t *TcpBind) lockEndpoint(endpoint string) func() {
+// lockEndpoint also returns the endpoint's dial count from before waiting.
+func (t *TcpBind) lockEndpoint(endpoint string) (*endpointMutex, uint64, func()) {
 	t.mu.Lock()
 	if t.endpointMu == nil {
 		t.endpointMu = make(map[string]*endpointMutex)
@@ -127,8 +154,9 @@ func (t *TcpBind) lockEndpoint(endpoint string) func() {
 	entry.refs++
 	t.mu.Unlock()
 
+	dials := entry.dials.Load()
 	entry.mu.Lock()
-	return func() {
+	return entry, dials, func() {
 		entry.mu.Unlock()
 		t.mu.Lock()
 		entry.refs--
@@ -153,7 +181,6 @@ func (l *reqLen) FromLen(len int) {
 }
 
 type recvData struct {
-	len      [4]byte
 	buff     []byte
 	size     int
 	endpoint Endpoint
@@ -204,23 +231,26 @@ func (t *TcpBind) handleConn(
 ) {
 	endpointKey := endpoint.DstToString()
 	go func() {
-		defer t.invalidateConn(endpointKey, conn)
+		defer func() {
+			t.invalidateConn(endpointKey, conn)
+			if conn.inbound {
+				t.inbound.Add(-1)
+			}
+		}()
 		for {
-			data := t.dataPool.Get().(*recvData)
-			// read uint32 size header
-			_, err := io.ReadFull(conn.conn, data.len[:])
-			if err != nil {
-				t.dataPool.Put(data)
+			// read uint32 size header, before taking a buffer, so an idle
+			// connection does not hold one
+			var l reqLen
+			if _, err := io.ReadFull(conn.conn, l[:]); err != nil {
 				return
 			}
-			l := reqLen(data.len)
 			size := l.Len()
 			if size < 0 || size > MaxSegmentSize {
-				t.dataPool.Put(data)
 				return
 			}
+			data := t.dataPool.Get().(*recvData)
 			// read real data
-			_, err = io.ReadFull(conn.conn, data.buff[:size])
+			_, err := io.ReadFull(conn.conn, data.buff[:size])
 			if err != nil {
 				t.dataPool.Put(data)
 				return
@@ -242,19 +272,39 @@ func (t *TcpBind) accept(
 	recvChan chan<- *recvData,
 	closeChan <-chan struct{},
 ) {
+	var backoff time.Duration
 	for {
 		rawConn, err := listener.AcceptTCP()
 		if err != nil {
-			return
+			if errors.Is(err, net.ErrClosed) {
+				return
+			}
+			select {
+			case <-closeChan:
+				return
+			default:
+			}
+			// e.g. out of file descriptors: retry rather than stop accepting
+			// until the next bind update
+			backoff = min(max(2*backoff, 5*time.Millisecond), time.Second)
+			time.Sleep(backoff)
+			continue
+		}
+		backoff = 0
+		if t.inbound.Add(1) > maxInboundTCPConns {
+			t.inbound.Add(-1)
+			_ = rawConn.Close()
+			continue
 		}
 		addrPort := rawConn.RemoteAddr().(*net.TCPAddr).AddrPort()
 		endpoint := &StdNetEndpoint{AddrPort: addrPort}
 		endpointKey := endpoint.DstToString()
-		conn := &tcpConn{conn: rawConn}
+		conn := &tcpConn{conn: rawConn, inbound: true}
 
 		t.mu.Lock()
 		if t.closeChan != closeChan {
 			t.mu.Unlock()
+			t.inbound.Add(-1)
 			_ = conn.Close()
 			return
 		}
@@ -264,6 +314,7 @@ func (t *TcpBind) accept(
 		if t.fwmark != 0 {
 			if err := setTCPConnMark(rawConn, t.fwmark); err != nil {
 				t.mu.Unlock()
+				t.inbound.Add(-1)
 				_ = conn.Close()
 				continue
 			}
@@ -286,14 +337,20 @@ func (t *TcpBind) Open(port uint16) (fns []ReceiveFunc, actualPort uint16, err e
 		return nil, 0, ErrBindAlreadyOpen
 	}
 
-	listener, err := net.ListenTCP("tcp", &net.TCPAddr{Port: int(port)})
-	if err != nil {
-		return nil, 0, err
-	}
-	if t.fwmark != 0 {
-		if err := setTCPListenerMark(listener, t.fwmark); err != nil {
-			_ = listener.Close()
+	// A client gets its replies over the connections it dials, so it listens
+	// only on a configured port. Port 0 is reported back for none, so the
+	// device asks for none again when it reopens the bind.
+	var listener *net.TCPListener
+	if port != 0 {
+		listener, err = net.ListenTCP("tcp", &net.TCPAddr{Port: int(port)})
+		if err != nil {
 			return nil, 0, err
+		}
+		if t.fwmark != 0 {
+			if err := setTCPListenerMark(listener, t.fwmark); err != nil {
+				_ = listener.Close()
+				return nil, 0, err
+			}
 		}
 	}
 	recvChan := make(chan *recvData)
@@ -305,9 +362,11 @@ func (t *TcpBind) Open(port uint16) (fns []ReceiveFunc, actualPort uint16, err e
 		t.tcpConnMap = make(map[string]*tcpConn)
 	}
 
-	go t.accept(listener, recvChan, closeChan)
+	if listener != nil {
+		go t.accept(listener, recvChan, closeChan)
+		actualPort = uint16(listener.Addr().(*net.TCPAddr).Port)
+	}
 	fn := t.makeReceive(recvChan, closeChan)
-	actualPort = uint16(listener.Addr().(*net.TCPAddr).Port)
 	return []ReceiveFunc{fn}, actualPort, nil
 }
 
@@ -357,13 +416,9 @@ func (t *TcpBind) ResetEndpoint(endpoint Endpoint) (bool, error) {
 	}
 	endpointKey := endpoint.DstToString()
 
-	// Synchronize with getConn so a dial already in progress cannot install a
-	// connection immediately after this reset.
-	t.connectMu.RLock()
-	defer t.connectMu.RUnlock()
-	unlockEndpoint := t.lockEndpoint(endpointKey)
-	defer unlockEndpoint()
-
+	// Never waits for a dial in progress: the caller holds the peer's handshake
+	// lock, and a connection dialed meanwhile is a fresh one anyway, which is
+	// all a reset is after.
 	t.mu.Lock()
 	conn := t.tcpConnMap[endpointKey]
 	if conn != nil {
@@ -399,7 +454,7 @@ func (t *TcpBind) getConn(endpoint Endpoint, rejected *tcpConn) (*tcpConn, error
 	// to connect and recover independently.
 	t.connectMu.RLock()
 	defer t.connectMu.RUnlock()
-	unlockEndpoint := t.lockEndpoint(endpointKey)
+	entry, dialsBefore, unlockEndpoint := t.lockEndpoint(endpointKey)
 	defer unlockEndpoint()
 
 	t.mu.Lock()
@@ -416,13 +471,15 @@ func (t *TcpBind) getConn(endpoint Endpoint, rejected *tcpConn) (*tcpConn, error
 	fwmark := t.fwmark
 	t.mu.Unlock()
 
-	dialer := net.Dialer{Timeout: tcpDialTimeout}
-	if fwmark != 0 {
-		dialer.Control = func(_, _ string, rawConn syscall.RawConn) error {
-			return setRawConnMark(rawConn, fwmark)
-		}
+	// A dial that ended while this caller waited already answered for it:
+	// failing right away beats another timeout under the device locks the
+	// caller holds.
+	if entry.dials.Load() != dialsBefore && entry.dialErr != nil {
+		return nil, entry.dialErr
 	}
-	raw, err := dialer.Dial("tcp", net.TCPAddrFromAddrPort(stdEndpoint.AddrPort).String())
+	raw, err := t.dialEndpoint(stdEndpoint, fwmark, closeChan)
+	entry.dialErr = err
+	entry.dials.Add(1)
 	if err != nil {
 		return nil, err
 	}
@@ -444,20 +501,37 @@ func (t *TcpBind) getConn(endpoint Endpoint, rejected *tcpConn) (*tcpConn, error
 		_ = conn.Close()
 		return current, nil
 	}
-	// If the mark changed while dialing, also clear an old nonzero mark.
-	// A socket created with Dialer.Control may still carry the previous mark
-	// when SetMark(0) races with the dial.
-	if fwmark != t.fwmark || t.fwmark != 0 {
-		if err := setTCPConnMark(rawConn, t.fwmark); err != nil {
-			t.mu.Unlock()
-			_ = conn.Close()
-			return nil, err
-		}
-	}
+	// The mark was applied while dialing, and connectMu keeps it from
+	// changing until this connection is installed.
 	t.tcpConnMap[endpointKey] = conn
 	t.handleConn(conn, stdEndpoint, recvChan, closeChan)
 	t.mu.Unlock()
 	return conn, nil
+}
+
+func (t *TcpBind) dialEndpoint(endpoint *StdNetEndpoint, fwmark uint32, closeChan <-chan struct{}) (net.Conn, error) {
+	ctx, cancel := context.WithTimeout(context.Background(), tcpDialTimeout)
+	defer cancel()
+	// Close aborts a dial in progress instead of waiting out its timeout.
+	go func() {
+		select {
+		case <-closeChan:
+			cancel()
+		case <-ctx.Done():
+		}
+	}()
+
+	dial := t.dial
+	if dial == nil {
+		var dialer net.Dialer
+		if fwmark != 0 {
+			dialer.Control = func(_, _ string, rawConn syscall.RawConn) error {
+				return setRawConnMark(rawConn, fwmark)
+			}
+		}
+		dial = dialer.DialContext
+	}
+	return dial(ctx, "tcp", net.TCPAddrFromAddrPort(endpoint.AddrPort).String())
 }
 
 func (t *TcpBind) Send(bufs [][]byte, endpoint Endpoint) error {

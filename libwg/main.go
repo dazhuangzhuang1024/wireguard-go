@@ -34,6 +34,10 @@ const (
 
 var wgDevice *device.Device
 
+// tcpBind is the device's bind in TCP mode, closed before the device so that
+// a send blocked on a dial or a stalled write cannot hold up the shutdown.
+var tcpBind conn.Bind
+
 // tnet is the userspace network stack used in netstack (SOCKS5) mode.
 // It is nil when running in the normal kernel-TUN mode.
 var tnet *netstack.Net
@@ -81,6 +85,9 @@ var logger *device.Logger
 
 //export stopWg
 func stopWg() {
+	if tcpBind != nil {
+		_ = tcpBind.Close()
+	}
 	if wgDevice != nil {
 		wgDevice.Close()
 		logger.Verbosef("Shutting down")
@@ -120,7 +127,8 @@ func startWg(logLevel, protocol C.int, interfaceName *C.cchar_t) C.int {
 	case 0:
 		wgDevice = device.NewDevice(tunDevice, conn.NewDefaultBind(), logger)
 	case 1:
-		wgDevice = device.NewDevice(tunDevice, conn.NewTCPBind(), logger)
+		tcpBind = conn.NewTCPBind()
+		wgDevice = device.NewDevice(tunDevice, tcpBind, logger)
 	default:
 		logger.Errorf("Protocol %d not supported", protocol)
 		return ExitSetupFailed
@@ -211,7 +219,8 @@ func startWgNetstack(logLevel, protocol C.int, addresses, dnsServers, socksListe
 	case 0:
 		wgDevice = device.NewDevice(tunDevice, conn.NewDefaultBind(), logger)
 	case 1:
-		wgDevice = device.NewDevice(tunDevice, conn.NewTCPBind(), logger)
+		tcpBind = conn.NewTCPBind()
+		wgDevice = device.NewDevice(tunDevice, tcpBind, logger)
 	default:
 		logger.Errorf("Protocol %d not supported", protocol)
 		return ExitSetupFailed

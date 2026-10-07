@@ -1,6 +1,7 @@
 package conn
 
 import (
+	"context"
 	"errors"
 	"fmt"
 	"io"
@@ -8,28 +9,54 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 )
 
 const tcpTestTimeout = 3 * time.Second
 
+// openTCPBind opens a client bind, which listens for nothing.
 func openTCPBind(t *testing.T) (*TcpBind, []ReceiveFunc, uint16) {
 	t.Helper()
+	return openTCPBindOn(t, 0)
+}
+
+// openTCPServerBind opens a bind that listens on a free port.
+func openTCPServerBind(t *testing.T) (*TcpBind, []ReceiveFunc, uint16) {
+	t.Helper()
+	return openTCPBindOn(t, freeTCPPort(t))
+}
+
+func openTCPBindOn(t *testing.T, port uint16) (*TcpBind, []ReceiveFunc, uint16) {
+	t.Helper()
 	bind := NewTCPBind().(*TcpBind)
-	receive, port, err := bind.Open(0)
+	receive, actualPort, err := bind.Open(port)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if port == 0 {
-		t.Fatal("Open(0) returned port 0")
+	if actualPort != port {
+		t.Fatalf("Open(%d) returned port %d", port, actualPort)
 	}
 	t.Cleanup(func() {
 		if err := bind.Close(); err != nil {
 			t.Errorf("close TCP bind: %v", err)
 		}
 	})
-	return bind, receive, port
+	return bind, receive, actualPort
+}
+
+func freeTCPPort(t *testing.T) uint16 {
+	t.Helper()
+	listener, err := net.ListenTCP("tcp", &net.TCPAddr{IP: net.IPv4(127, 0, 0, 1)})
+	if err != nil {
+		t.Fatal(err)
+	}
+	port := uint16(listener.Addr().(*net.TCPAddr).Port)
+	if err := listener.Close(); err != nil {
+		t.Fatal(err)
+	}
+	return port
 }
 
 func listenTCP(t *testing.T) *net.TCPListener {
@@ -117,7 +144,7 @@ func TestReqLen(t *testing.T) {
 }
 
 func TestTCPBindSendReceive(t *testing.T) {
-	_, receive, port := openTCPBind(t)
+	_, receive, port := openTCPServerBind(t)
 	client, _, _ := openTCPBind(t)
 	endpoint, err := client.ParseEndpoint(fmt.Sprintf("127.0.0.1:%d", port))
 	if err != nil {
@@ -152,7 +179,7 @@ func TestTCPBindSendReceive(t *testing.T) {
 }
 
 func TestTCPBindReceiveOversizedFrame(t *testing.T) {
-	listener, _, port := openTCPBind(t)
+	listener, _, port := openTCPServerBind(t)
 	conn, err := net.DialTCP(
 		"tcp",
 		nil,
@@ -185,7 +212,7 @@ func TestTCPBindReceiveOversizedFrame(t *testing.T) {
 }
 
 func TestTCPBindRejectsOversizedOutboundFrame(t *testing.T) {
-	client, _, port := openTCPBind(t)
+	client, _, port := openTCPServerBind(t)
 	endpoint, err := client.ParseEndpoint(fmt.Sprintf("127.0.0.1:%d", port))
 	if err != nil {
 		t.Fatal(err)
@@ -412,11 +439,11 @@ func TestTCPBindResetEndpointIsScoped(t *testing.T) {
 
 func TestTCPBindEndpointLocksAreScoped(t *testing.T) {
 	bind := NewTCPBind().(*TcpBind)
-	unlockA := bind.lockEndpoint("endpoint-a")
+	_, _, unlockA := bind.lockEndpoint("endpoint-a")
 
 	acquiredB := make(chan struct{})
 	go func() {
-		unlockB := bind.lockEndpoint("endpoint-b")
+		_, _, unlockB := bind.lockEndpoint("endpoint-b")
 		close(acquiredB)
 		unlockB()
 	}()
@@ -428,7 +455,7 @@ func TestTCPBindEndpointLocksAreScoped(t *testing.T) {
 
 	acquiredA := make(chan struct{})
 	go func() {
-		unlockSecondA := bind.lockEndpoint("endpoint-a")
+		_, _, unlockSecondA := bind.lockEndpoint("endpoint-a")
 		close(acquiredA)
 		unlockSecondA()
 	}()
@@ -543,12 +570,12 @@ func TestTCPBindSerializesConcurrentFrames(t *testing.T) {
 func TestTCPBindCloseIsIdempotentAndReopenable(t *testing.T) {
 	bind := NewTCPBind().(*TcpBind)
 	t.Cleanup(func() { _ = bind.Close() })
-	receive, firstPort, err := bind.Open(0)
+	receive, firstPort, err := bind.Open(freeTCPPort(t))
 	if err != nil {
 		t.Fatal(err)
 	}
 	if firstPort == 0 {
-		t.Fatal("first Open(0) returned port 0")
+		t.Fatal("first Open returned port 0")
 	}
 	if _, _, err := bind.Open(0); !errors.Is(err, ErrBindAlreadyOpen) {
 		t.Fatalf("second Open() error = %v, want %v", err, ErrBindAlreadyOpen)
@@ -569,12 +596,12 @@ func TestTCPBindCloseIsIdempotentAndReopenable(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	newReceive, secondPort, err := bind.Open(0)
+	newReceive, secondPort, err := bind.Open(freeTCPPort(t))
 	if err != nil {
 		t.Fatal(err)
 	}
 	if secondPort == 0 {
-		t.Fatal("second Open(0) returned port 0")
+		t.Fatal("second Open returned port 0")
 	}
 
 	bufs := [][]byte{make([]byte, MaxSegmentSize)}
@@ -599,5 +626,231 @@ func TestTCPBindCloseIsIdempotentAndReopenable(t *testing.T) {
 	}
 	if err := bind.Close(); err != nil {
 		t.Fatal(err)
+	}
+}
+
+// blockingDial makes every dial of bind wait until release is closed, then
+// connect to target. started receives one value per dial.
+func blockingDial(bind *TcpBind, target string) (started <-chan struct{}, release chan struct{}, dials *atomic.Int32) {
+	startedChan := make(chan struct{}, 16)
+	release = make(chan struct{})
+	dials = new(atomic.Int32)
+	bind.dial = func(ctx context.Context, network, _ string) (net.Conn, error) {
+		dials.Add(1)
+		startedChan <- struct{}{}
+		select {
+		case <-release:
+		case <-ctx.Done():
+			return nil, ctx.Err()
+		}
+		if target == "" {
+			return nil, errors.New("dial refused")
+		}
+		var dialer net.Dialer
+		return dialer.DialContext(ctx, network, target)
+	}
+	return startedChan, release, dials
+}
+
+func waitForSignal(t *testing.T, signal <-chan struct{}, description string) {
+	t.Helper()
+	select {
+	case <-signal:
+	case <-time.After(tcpTestTimeout):
+		t.Fatalf("timed out waiting for %s", description)
+	}
+}
+
+func TestTCPBindResetEndpointDoesNotWaitForADial(t *testing.T) {
+	server := listenTCP(t)
+	client, _, _ := openTCPBind(t)
+	endpoint, err := client.ParseEndpoint(server.Addr().String())
+	if err != nil {
+		t.Fatal(err)
+	}
+	started, release, _ := blockingDial(client, server.Addr().String())
+
+	sent := make(chan error, 1)
+	go func() { sent <- client.Send([][]byte{[]byte("fresh")}, endpoint) }()
+	waitForSignal(t, started, "the dial to start")
+
+	resetDone := make(chan struct{})
+	go func() {
+		if reset, err := client.ResetEndpoint(endpoint); err != nil || reset {
+			t.Errorf("reset during a dial = %v, %v; want false, nil", reset, err)
+		}
+		close(resetDone)
+	}()
+	waitForSignal(t, resetDone, "the reset, which must not wait for the dial")
+
+	close(release)
+	if err := <-sent; err != nil {
+		t.Fatal(err)
+	}
+	conn := acceptTCP(t, server)
+	t.Cleanup(func() { _ = conn.Close() })
+	if got := string(readTCPFrame(t, conn)); got != "fresh" {
+		t.Fatalf("frame = %q, want %q", got, "fresh")
+	}
+	if tcpConnectionCount(client) != 1 {
+		t.Fatal("the connection dialed during the reset was not kept")
+	}
+}
+
+func TestTCPBindWaitersShareAFailedDial(t *testing.T) {
+	client, _, _ := openTCPBind(t)
+	endpoint, err := client.ParseEndpoint("127.0.0.1:9")
+	if err != nil {
+		t.Fatal(err)
+	}
+	started, release, dials := blockingDial(client, "")
+
+	results := make(chan error, 2)
+	go func() { results <- client.Send([][]byte{[]byte("a")}, endpoint) }()
+	waitForSignal(t, started, "the first dial to start")
+	go func() { results <- client.Send([][]byte{[]byte("b")}, endpoint) }()
+	waitForTCPCondition(t, func() bool {
+		client.mu.Lock()
+		defer client.mu.Unlock()
+		entry := client.endpointMu[endpoint.DstToString()]
+		return entry != nil && entry.refs == 2
+	}, "the second send to wait for the dial")
+
+	close(release)
+	for i := 0; i < 2; i++ {
+		if err := <-results; err == nil {
+			t.Fatal("send over a failed dial succeeded")
+		}
+	}
+	if got := dials.Load(); got != 1 {
+		t.Fatalf("dials = %d, want 1 shared by both sends", got)
+	}
+}
+
+func TestTCPBindCloseAbortsADial(t *testing.T) {
+	client := NewTCPBind().(*TcpBind)
+	if _, _, err := client.Open(0); err != nil {
+		t.Fatal(err)
+	}
+	endpoint, err := client.ParseEndpoint("127.0.0.1:9")
+	if err != nil {
+		t.Fatal(err)
+	}
+	started, _, _ := blockingDial(client, "")
+
+	sent := make(chan error, 1)
+	go func() { sent <- client.Send([][]byte{[]byte("a")}, endpoint) }()
+	waitForSignal(t, started, "the dial to start")
+	if err := client.Close(); err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case err := <-sent:
+		if err == nil {
+			t.Fatal("send succeeded although the bind was closed")
+		}
+	case <-time.After(tcpDialTimeout / 2):
+		t.Fatal("close did not abort the dial")
+	}
+}
+
+func TestTCPBindWriteFailsOnAStalledPeer(t *testing.T) {
+	saved := tcpWriteTimeout
+	tcpWriteTimeout = 200 * time.Millisecond
+	t.Cleanup(func() { tcpWriteTimeout = saved })
+
+	server := listenTCP(t)
+	client, _, _ := openTCPBind(t)
+	endpoint, err := client.ParseEndpoint(server.Addr().String())
+	if err != nil {
+		t.Fatal(err)
+	}
+	conn, err := client.getConn(endpoint, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	// accepted, never read
+	stalled := acceptTCP(t, server)
+	t.Cleanup(func() { _ = stalled.Close() })
+
+	// a typical packet, so the size allowance on top of the timeout is small
+	frame := make([]byte, 1400)
+	deadline := time.Now().Add(tcpTestTimeout * 3)
+	for {
+		err := conn.Write([][]byte{frame})
+		if err != nil {
+			var netErr net.Error
+			if !errors.As(err, &netErr) || !netErr.Timeout() {
+				t.Fatalf("write to a stalled peer failed with %v, want a timeout", err)
+			}
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("writes to a stalled peer never timed out")
+		}
+	}
+	if err := conn.Write([][]byte{[]byte("after")}); !errors.Is(err, net.ErrClosed) {
+		t.Fatalf("write after a failed one = %v, want net.ErrClosed", err)
+	}
+}
+
+func TestTCPBindDoesNotListenWithoutAPort(t *testing.T) {
+	// what the device does on Down and Up: reopen with the port it got back
+	client := NewTCPBind().(*TcpBind)
+	port := uint16(0)
+	for i := 0; i < 2; i++ {
+		_, actualPort, err := client.Open(port)
+		if err != nil {
+			t.Fatal(err)
+		}
+		client.mu.Lock()
+		listener := client.listener
+		client.mu.Unlock()
+		if actualPort != 0 || listener != nil {
+			t.Fatalf("Open(%d) listens on port %d", port, actualPort)
+		}
+		if err := client.Close(); err != nil {
+			t.Fatal(err)
+		}
+		port = actualPort
+	}
+}
+
+func TestTCPBindCapsInboundConnections(t *testing.T) {
+	_, _, port := openTCPServerBind(t)
+	address := net.JoinHostPort("127.0.0.1", strconv.Itoa(int(port)))
+	conns := make([]net.Conn, 0, maxInboundTCPConns+1)
+	t.Cleanup(func() {
+		for _, conn := range conns {
+			_ = conn.Close()
+		}
+	})
+	for i := 0; i <= maxInboundTCPConns; i++ {
+		conn, err := net.DialTimeout("tcp", address, tcpTestTimeout)
+		if err != nil {
+			t.Fatal(err)
+		}
+		conns = append(conns, conn)
+	}
+
+	// exactly the one over the limit gets closed
+	var closed atomic.Int32
+	var wg sync.WaitGroup
+	for _, conn := range conns {
+		wg.Add(1)
+		go func(conn net.Conn) {
+			defer wg.Done()
+			_ = conn.SetReadDeadline(time.Now().Add(200 * time.Millisecond))
+			if _, err := conn.Read(make([]byte, 1)); err != nil {
+				var netErr net.Error
+				if !errors.As(err, &netErr) || !netErr.Timeout() {
+					closed.Add(1)
+				}
+			}
+		}(conn)
+	}
+	wg.Wait()
+	if closed := closed.Load(); closed != 1 {
+		t.Fatalf("%d inbound connections were closed, want 1", closed)
 	}
 }

@@ -152,6 +152,12 @@ func (peer *Peer) handshakeInitiationReady(isRetry bool, now time.Time) (ready b
 	if isRetry && peer.hasConfirmedKeypairSinceLastHandshake() {
 		return false, 0
 	}
+	// RoutineHandshake turns a consumed response into a session right away;
+	// a new initiation now would discard it, and a retry would also reset the
+	// connection it came on.
+	if peer.handshake.state == handshakeResponseConsumed {
+		return false, 0
+	}
 	elapsed := now.Sub(peer.handshake.lastSentHandshake)
 	if elapsed < RekeyTimeout {
 		return false, RekeyTimeout - elapsed

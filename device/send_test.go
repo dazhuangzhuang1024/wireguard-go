@@ -259,3 +259,71 @@ func TestNewHandshakeClearsAttemptsOnlyAfterInitiationIsCreated(t *testing.T) {
 		t.Fatalf("created initiation events = %v, want [send]", events)
 	}
 }
+
+func TestTrafficLeavesAnOutstandingRetryToTheTimer(t *testing.T) {
+	peer, bind := newHandshakeRetryPeer(t)
+	peer.timers.retransmitHandshake.Mod(time.Hour)
+	t.Cleanup(peer.timers.retransmitHandshake.Del)
+
+	// due for a new initiation, but the timer owns the outstanding one
+	if err := peer.SendHandshakeInitiation(false); err != nil {
+		t.Fatal(err)
+	}
+	if events := bind.snapshot(); len(events) != 0 {
+		t.Fatalf("traffic-driven initiation produced events %v, want none", events)
+	}
+
+	if err := peer.sendHandshakeInitiation(true, true); err != nil {
+		t.Fatal(err)
+	}
+	if events := bind.snapshot(); len(events) != 2 || events[0] != "reset" || events[1] != "send" {
+		t.Fatalf("timer retry events = %v, want [reset send]", events)
+	}
+}
+
+func TestInitiationsKeepAConsumedResponse(t *testing.T) {
+	peer, bind := newHandshakeRetryPeer(t)
+	peer.handshake.mutex.Lock()
+	peer.handshake.state = handshakeResponseConsumed
+	peer.handshake.mutex.Unlock()
+
+	if err := peer.sendHandshakeInitiation(true, true); err != nil {
+		t.Fatal(err)
+	}
+	if err := peer.SendHandshakeInitiation(false); err != nil {
+		t.Fatal(err)
+	}
+	if events := bind.snapshot(); len(events) != 0 {
+		t.Fatalf("initiations over a consumed response produced events %v, want none", events)
+	}
+	peer.handshake.mutex.RLock()
+	state := peer.handshake.state
+	peer.handshake.mutex.RUnlock()
+	if state != handshakeResponseConsumed {
+		t.Fatalf("initiation changed handshake state to %v", state)
+	}
+}
+
+func TestTCPBindStaysWithoutAListenerAcrossDownUp(t *testing.T) {
+	tun := tuntest.NewChannelTUN()
+	tunDevice := tun.TUN()
+	<-tunDevice.Events()
+	device := NewDevice(tunDevice, conn.NewTCPBind(), NewLogger(LogLevelSilent, ""))
+	t.Cleanup(device.Close)
+
+	// BindUpdate reopens the bind with the port the last Open returned
+	for i := 0; i < 3; i++ {
+		if err := device.Up(); err != nil {
+			t.Fatal(err)
+		}
+		device.net.RLock()
+		port := device.net.port
+		device.net.RUnlock()
+		if port != 0 {
+			t.Fatalf("round %d: the TCP bind listens on port %d, want none", i, port)
+		}
+		if err := device.Down(); err != nil {
+			t.Fatal(err)
+		}
+	}
+}

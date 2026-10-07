@@ -104,6 +104,16 @@ func (peer *Peer) rescheduleHandshakeRetry(isRetry bool, retryAfter time.Duratio
 }
 
 func (peer *Peer) sendHandshakeInitiation(isRetry bool, resetEndpoint bool) error {
+	// While an initiation is outstanding, its retransmission belongs to the
+	// timer, which also resets a connection-oriented endpoint. Traffic would
+	// otherwise win that race every time and keep reusing a blackholed
+	// connection. Like any skipped initiation, this leaves handshakeAttempts
+	// alone, so in an outage the timer gives up after MaxTimerHandshakes even
+	// with traffic flowing, and the next packet or keepalive starts over.
+	if !isRetry && peer.timers.retransmitHandshake != nil && peer.timers.retransmitHandshake.IsPending() {
+		return nil
+	}
+
 	peer.handshake.mutex.RLock()
 	ready, retryAfter := peer.handshakeInitiationReady(isRetry, time.Now())
 	peer.handshake.mutex.RUnlock()
